@@ -1,0 +1,15 @@
+{
+    "files.associations": {
+        "stdio.h": "c",
+        "server.h": "c",
+        "unistd.h": "c",
+        "errno.h": "c",
+        "cstdlib": "c",
+        "epoll.h": "c",
+        "signal.h": "c",
+        "inet.h": "c",
+        "pthread.h": "c",
+        "in.h": "c",
+        "stdint.h": "c"
+    }
+}
