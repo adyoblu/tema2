@@ -3,9 +3,11 @@ CFLAGS = -g
 
 all: client server
 
-clientsocket: client.c
-	$(CC) $(CFLAGS) -lpthread client.c -o client
-serversocket: server.c
-	$(CC) $(CFLAGS) -lpthread server.c -o server
+client: client.c file.c
+	$(CC) $(CFLAGS) client.c file.c -o client
+
+server: server.c file.c
+	$(CC) $(CFLAGS) -lpthread server.c file.c -o server
+
 clean:
-	rm -f client.o server.o
+	rm -f client server file

@@ -1,4 +1,4 @@
-#include "server.h"
+#include "file.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +13,12 @@
 #include <errno.h>
 #include <sys/signalfd.h>
 #include <signal.h>
+#include <stdint.h>
+#include <sys/epoll.h>
+#include <dirent.h>
+#include <sys/sendfile.h>
 
+#define ROOT_DIRECTORY "root_dir"
 #define MAX_CLIENTS 10
 #define BUFFER_SIZE 4096
 #define LIST 0x0
@@ -25,15 +30,31 @@
 #define SEARCH 0x20
 #define MAX_EVENTS 3
 
+#define SUCCESS 0x0
+#define FILE_NOT_FOUND 0x1
+#define PERMISSION_DENIED 0x2
+#define OUT_OF_MEMORY 0x4
+#define SERVER_BUSY 0x8
+#define UNKNOWN_OPERATION 0x10
+#define BAD_ARGUMENTS 0x20
+#define OTHER_ERROR 0x40
+
 uint32_t status;
-static File *file_list = NULL;
 static pthread_mutex_t file_list_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_key_t thread_info_key;
 int epoll_fd;
 int signal_fd;
 int epollfd;
 int server_sockfd;
-volatile sig_atomic_t graceful = 0; 
+volatile sig_atomic_t graceful = 0;
+File *file_list = NULL;
+
+typedef struct {
+    int sockfd;
+    struct epoll_event event;
+    pthread_t thread_id;
+} ThreadInfo;
+
 void cleanup_thread_info(void *data) {
     free(data);
 }
@@ -54,83 +75,108 @@ ThreadInfo* alloc_thread_info(int client_sockfd, ThreadInfo *thread_info, int ep
     return info;
 }
 
-void add_file(const char *path, uint32_t size) {
-    File *new_file = (File *) malloc(sizeof(File));
-    strcpy(new_file->path, path);
-    new_file->size = size;
-    new_file->next = file_list;
-    file_list = new_file;
-}
+void load_files_recursive(const char *directory, File **head) {
+    DIR *dir;
+    struct dirent *entry;
 
-void remove_file(const char *path) {
-    File **current = &file_list;
-    while (*current != NULL) {
-        if (strcmp((*current)->path, path) == 0) {
-            File *next_file = (*current)->next;
-            free(*current);
-            *current = next_file;
-            return;
+    if ((dir = opendir(directory)) != NULL) {
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_type == DT_DIR) {
+                // Skip "." and ".." entries for directories
+                if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+                    char subdirectory[1024];
+                    snprintf(subdirectory, sizeof(subdirectory), "%s/%s", directory, entry->d_name);
+                    load_files_recursive(subdirectory, head);
+                }
+            } else {
+                char file_path[1024];
+                snprintf(file_path, sizeof(file_path), "%s/%s", directory, entry->d_name);
+
+                // Remove the root_directory prefix
+                const char *relative_path = file_path + strlen(ROOT_DIRECTORY);
+                if (relative_path[0] == '/') {
+                    relative_path++;  // Skip the leading '/'
+                }
+
+                // Add the file to the linked list
+                *head = add_node_last(*head, relative_path);
+            }
         }
-        current = &(*current)->next;
+        closedir(dir);
+    } else {
+        perror("Error opening directory");
     }
 }
 
-void update_file_list() {
-    pthread_mutex_lock(&file_list_mutex);
-    File *current = file_list;
-    while (current != NULL) {
-        printf("%s (%u bytes)\n", current->path, current->size);
-        current = current->next;
-    }
-    pthread_mutex_unlock(&file_list_mutex);
+void load_files(const char *directory) {
+    load_files_recursive(directory, &file_list);
+    //print_files(file_list);
 }
 
-int send_file(int client_sockfd, const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd == -1) {
-        perror("open");
-        return -1;
+void send_list(int sock) {
+    int32_t sent = SUCCESS;
+    send(sock, &sent, sizeof(sent), 0);  // status
+    int temp_fd = open("/tmp/temp_file", O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+
+    File *head = file_list;
+    while (head != NULL) {
+        write(temp_fd, head->path, strlen(head->path));
+        write(temp_fd, "\0", 1);
+        head = head->next;
     }
 
-    struct stat st;
-    fstat(fd, &st);
+    off_t file_size = lseek(temp_fd, 0, SEEK_END);
 
-    uint32_t file_size = st.st_size;
-    if (send(client_sockfd, &file_size, sizeof(file_size), 0) == -1) {
-        perror("send");
-        close(fd);
-        return -1;
-    }
+    //număr octeți răspuns
+    send(sock, &file_size, sizeof(file_size), 0);
 
-    sendfile(client_sockfd, fd, NULL, file_size);
-    close(fd);
+    lseek(temp_fd, 0, SEEK_SET);
 
-    return 0;
+    //lista de fișiere, separate prin ‘\0’
+    char buffer[1024];
+    ssize_t bytes_read;
+    while ((bytes_read = read(temp_fd, buffer, sizeof(buffer))) > 0)
+        send(sock, buffer, bytes_read, 0);
+
+    close(temp_fd);
+    unlink("/tmp/temp_file");
 }
 
-int receive_file(int client_sockfd, const char *path) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-    if (fd == -1) {
-        perror("open");
-        return -1;
+
+void download(int sock) {
+    size_t bytes;
+    char buffer[1024];
+    //IN
+    recv(sock, &bytes, sizeof(bytes), 0); // numar octeti cale fisier
+    recv(sock, buffer, bytes, 0); // cale fisier
+    //OUT
+    //status; 
+    int32_t sent = SUCCESS;
+    send(sock, &sent, sizeof(sent), 0);  // status
+
+    char result[1024];
+    strcpy(result, ROOT_DIRECTORY);
+    strcat(result, "/");
+    strcat(result, buffer);
+
+    int file_fd = open(result, O_RDONLY);
+    if (file_fd == -1) {
+        perror("Error opening file");
+        return;
     }
 
-    uint32_t file_size;
-    if (recv(client_sockfd, &file_size, sizeof(file_size), 0) == -1) {
-        perror("recv");
-        close(fd);
-        return -1;
+    struct stat stat_buf;
+    fstat(file_fd, &stat_buf);
+
+    off_t file_size = stat_buf.st_size;
+    send(sock, &file_size, sizeof(file_size), 0);
+    off_t offset = 0;
+    ssize_t sent_bytes = sendfile(sock, file_fd, &offset, file_size);
+
+    if (sent_bytes == -1) {
+        perror("Error sending file");
     }
-
-    if (sendfile(fd, client_sockfd, NULL, file_size) == -1) {
-        perror("sendfile");
-        close(fd);
-        return -1;
-    }
-
-    close(fd);
-
-    return 0;
+    close(file_fd);
 }
 
 void *client_handler(void *arg) {
@@ -138,6 +184,7 @@ void *client_handler(void *arg) {
     ThreadInfo *thread_info = (ThreadInfo*)arg;
     int client_sockfd = thread_info->sockfd;
     uint32_t operation;
+    size_t len;
     ssize_t bytes_received = recv(client_sockfd, &operation, sizeof(operation), 0);
     if (bytes_received < 0) {
         fprintf(stderr, "Error receiving data from client\n");
@@ -150,20 +197,30 @@ void *client_handler(void *arg) {
 
     fprintf(stderr, "0x%x\n", operation);
 
-    switch (operation) {//de implementat functiile si aici si la client
+    switch (operation) {
         case LIST:
+            send_list(client_sockfd);
             break;
         case DOWNLOAD:
+            send_list(client_sockfd);
+            download(client_sockfd);
             break;
         case UPLOAD:
+            //OUT: status
             break;
         case DELETE:
+            //OUT: status
             break;
         case MOVE:
+            //OUT: status
             break;
         case UPDATE:
+            //
             break;
         case SEARCH:
+            //OUT: status; 
+            //nr_octeti_dimensiune_lista; 
+            //listă de fișiere separate prin '\0'
             break;
     }
     close(client_sockfd);
@@ -226,7 +283,7 @@ void *signal_handler_thread(void *arg) {
                     printf("\nGraceful termination.\n");
                     graceful = 1;
                 }
-            }
+            }   
         }
         for (int i = 0; i < nfds; ++i) {
             if (events[i].data.fd == fileno(stdin)) {
@@ -245,6 +302,7 @@ void *signal_handler_thread(void *arg) {
 }
 
 int main(int argc, char* argv[]) {
+    load_files(ROOT_DIRECTORY);
     int n;
     if(argc >= 2) 
         n = atoi(argv[1]);
@@ -255,6 +313,7 @@ int main(int argc, char* argv[]) {
     socklen_t client_len;
     int epoll_fd, epoll_fd_signal;
     struct epoll_event events[n];
+    ThreadInfo *thread_info;
     server_sockfd = initialise_server_sock(n);
 
     sigset_t set;
@@ -313,10 +372,14 @@ int main(int argc, char* argv[]) {
                     perror("accept");
                     continue;
                 }
-                ThreadInfo *thread_info = alloc_thread_info(client_sockfd, thread_info, EPOLLIN);
-
+                thread_info = alloc_thread_info(client_sockfd, thread_info, EPOLLIN);
+                
                 epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_sockfd, &thread_info->event);
                 pthread_create(&thread_info->thread_id, NULL, client_handler, (void*)thread_info);
+            }
+            if(graceful == 1){
+                pthread_join(thread_info->thread_id, NULL);
+                exit(EXIT_SUCCESS);
             }
         }
     }
